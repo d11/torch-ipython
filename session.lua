@@ -1,5 +1,5 @@
 require 'libluazmq'
-require 'uuid'
+local uuid = require 'uuid'
 
 local Message = torch.class("ipython.Message")
 
@@ -50,7 +50,7 @@ end
 
 local Session = torch.class("ipython.Session")
 
-function Session.__init(args)
+function Session:__init(args)
     args.username = args.username or os.getenv('USER')
 
     self.username = username
