@@ -1,4 +1,5 @@
 require 'libluazmq'
+require 'json'
 local uuid = require 'uuid'
 
 local Message = torch.class("ipython.Message")
@@ -78,14 +79,14 @@ function Session:send(socket, msg_type, content, parent, ident)
     if ident then
         socket:send(ident, zmq.SNDMORE)
     end
-    socket:send_json(msg)
+    socket:send(json.encode(msg))
     local omsg = Message(msg)
     return omsg
 end
 
 function Session:recv(socket, mode)
     mode = mode or zmq.NOBLOCK
-    local result, msg = pcall(socket:recv_json(mode))
+    local result, msg = pcall(json.decode(socket:recv(mode)))
     if result then
         return Message(msg)
     else

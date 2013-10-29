@@ -11,7 +11,7 @@ description = {
   homepage = "https://github.com/d11/torch-ipython"
 }
 
-dependencies = { 'torch >= 7.0', 'parallel', 'uuid'}
+dependencies = { 'torch >= 7.0', 'parallel', 'uuid', 'luajson'}
 build = {
    type = "command",
    build_command = [[

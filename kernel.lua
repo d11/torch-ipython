@@ -1,14 +1,17 @@
 require 'libluazmq'
 require 'socket'
+require 'json'
 
 ipython = {}
 
 dofile('session.lua')
+dofile('completer.lua')
 
 --! A file like object that publishes the stream to a 0MQ PUB socket.
 local OutStream = torch.class("ipython.OutStream")
 
 function OutStream:__init(session, pub_socket, name, max_buffer)
+    max_buffer = max_buffer or 200
     self.session = session
     self.pub_socket = pub_socket
     self.name = name
@@ -33,11 +36,11 @@ function OutStream:flush()
         if self._buffer then
             local data = table.concat(self._buffer)
             local content = { name = self.name, data = data }
-            local msg = self.session.msg('stream', content, self.parent_header)
+            local msg = self.session:msg('stream', content, self.parent_header)
             print(ipython.Message(msg))
-            self.pub_socet.send_json(msg)
+            self.pub_socket:send(json.encode(msg))
             self._buffer_len = 0
-            self._bufer = {}
+            self._buffer = {}
         end
     end
 end
@@ -63,7 +66,7 @@ function OutStream:write(s)
 end
 
 function OutStream:_maybe_send()
-    if string.find(self.buffer[#self.buffer], "\n") then
+    if string.find(self._buffer[#self._buffer], "\n") then
         self:flush()
     end
     if self._buffer_len > self.max_buffer then
@@ -95,7 +98,7 @@ function DisplayHook:__call(obj)
 
     -- __builtin__._ = obj -- ?
     local msg = self.session:msg("pytout", { data = tostring(obj) }, self.parent_header)
-    self.pub_socket:send_json(msg)
+    self.pub_socket:send(json.encode(msg))
 end
 function DisplayHook:set_parent(parent)
     self.parent_header = extract_header(parent)
@@ -110,9 +113,9 @@ end
 
 function RawInput:__call(prompt)
     local msg = self.session:msg('raw_input')
-    self.socket:send_json(msg)
+    self.socket:send(json.encode(msg))
     while true do
-        local result, msg = self.socket:recv_json(zmq.NOBLOCK)
+        local result, msg = json.decode(self.socket:recv(zmq.NOBLOCK))
         if result then
             return msg.content.data
         end
@@ -123,14 +126,16 @@ function RawInput:__call(prompt)
 end
 
 local Kernel = torch.class("ipython.Kernel")
-function Kernel:__init(session, reply_socket, pub_socket)
+function Kernel:__init(session, reply_socket, pub_socket, stdout, stderr)
+    self.stdout = stdout
+    self.stderr = stderr
     self.session = session
     self.reply_socket = reply_socket
     self.pub_socket = pub_socket
     self.user_ns = {}
     self.history = {}
-    self.compiler = CommandCompiler()
-    self.completer = KernelCompleter(self.user_ns)
+--    self.compiler = CommandCompiler()
+    self.completer = ipython.KernelCompleter(self.user_ns)
 
     -- Build dict of handlers for message types
     self.handlers = {}
@@ -152,14 +157,14 @@ function Kernel:abort_queue()
         if self.reply_socket.rcvmore ~= 0 then
             error("Unexpected missing message part")
         end
-        msg = self.reply_socket:recv_json()
+        msg = json.decode(self.reply_socket:recv())
         print("Aborting:", ipython.Message(msg))
         local msg_type = msg.msg_type
         local reply_type = msg_type:gmatch("_")[1] .. "_reply"
         local reply_msg = self.session.msg(reply_type, { status = 'aborted'}, msg)
         print(ipython.Message(reply_msg))
         self.reply_socket:send(ident, zmq.SNDMORE)
-        self.reply_socket:send_json(reply_msg)
+        self.reply_socket:send(json.encode(reply_msg))
         socket.sleep(0.1)
     end
 end
@@ -171,12 +176,17 @@ function Kernel:execute_request(ident, parent)
     end
     local code = parent.content.code
     local pyin_msg = self.session:msg('pyin', {code=code}, parent)
-    self.pub_socket:send_json(pyin_msg)
-    local comp_code = self.compiler(code, '<zmq-kernel>')
+    self.pub_socket:send(json.encode(pyin_msg))
+--    local comp_code = self.compiler(code, '<zmq-kernel>')
+    local comp_code = code
     -- TODO sys.displayhook.set_parent(parent)
-    local func = function() loadstring(comp_code) end
-    setfenv(func, self.user_ns)
-    local result, returned = pcall(func())
+    local func, msg = loadstring(comp_code)
+    local result
+    local returned = msg
+    if func then
+        setfenv(func, self.user_ns)
+        result, returned = pcall(func)
+    end
     local reply_content
     if not result then
         local res = 'error'
@@ -188,15 +198,15 @@ function Kernel:execute_request(ident, parent)
             evalue = returned
         }
         local exc_msg = self.session:msg('pyerr', exc_content, parent)
-        self.pub_socket:send_json(exc_msg)
+        self.pub_socket:send(json.encode(exc_msg))
         reply_content = exc_content
-    else 
+    else
         reply_content = {status = 'ok'}
     end
     local reply_msg = self.session:msg('execute_reply', reply_content, parent)
     print(ipython.Message(reply_msg))
-    self.reply_socket:send(ident, zmq.SNDMORE)
-    self.reply_socket:send_json(reply_msg)
+--    self.reply_socket:send(ident, zmq.SNDMORE) -- TODO ?
+    self.reply_socket:send(json.encode(reply_msg))
     if reply_msg.content.status == 'error' then
         self:abort_queue()
     end
@@ -215,17 +225,21 @@ function Kernel:complete(msg)
     return self.completer:complete(msg.content.line, msg.content.text)
 end
 function Kernel:start()
+    print("starting....")
     while true do
-        local ident = self.reply_socket:recv()
-        assert(self.reply_socket.rcvmore ~= 0, "Unexpected missing message part")
-        local msg = self.reply_socket:recv_json()
+        print("waiting on reply socket")
+--        local ident = self.reply_socket:recv()
+--        print("recieved ident " .. ident)
+--        assert(self.reply_socket.rcvmore ~= 0, "Unexpected missing message part")
+        local msg = json.decode(self.reply_socket:recv())
+        print("recieved msg ", msg)
         local omsg = ipython.Message(msg)
         print(omsg)
-        local handler = self.handler[omsg.msg_type]
+        local handler = self.handlers[omsg.msg_type]
         if not handler then
             print("UNKNOWN MESSAGE TYPE: " .. omsg)
         else
-            handler(ident, omsg)
+            handler(self, ident, omsg)
         end
     end
 end
@@ -250,18 +264,26 @@ function main()
 
     local stdout = ipython.OutStream(session, pub_socket, 'stdout')
     local stderr = ipython.OutStream(session, pub_socket, 'stderr')
-    print = function(args)
-        stdout:write(table.concat(args))
+    local newprint = function(args)
+        print("print", args)
+        local msg = args
+        if type(args) == 'table' then
+            msg = table.concat(args)
+        end
+        stdout:write(tostring(msg).. "\n")
     end
-    local display_hook = DisplayHook(session, pub_socket)
+    local display_hook = ipython.DisplayHook(session, pub_socket)
     -- sys.display_hook = display_hook
 
     local kernel = ipython.Kernel(session, reply_socket, pub_socket)
+    kernel.user_ns['print'] = newprint
+    kernel.user_ns['torch'] = torch
+    kernel.user_ns['loadstring'] = loadstring
     kernel.user_ns['sleep'] = socket.sleep
     kernel.user_ns['s'] = "test string"
 
     print "Use Ctrl-\\ (NOT Ctrl-C!) to terminate."
-    kernel.start()
+    kernel:start()
 
 end
 
